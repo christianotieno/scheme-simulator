@@ -1,1 +1,26 @@
 build/
+
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Coverage output
+*.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Environment files
+.env
+
+# IDE/editor
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
