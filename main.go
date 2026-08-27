@@ -30,6 +30,11 @@ type Server struct {
 	boundAddr  string
 	conns      sync.WaitGroup // one per in-flight connection; drained by Shutdown
 	acceptDone chan struct{}  // closed when the accept loop returns
+
+	shutdown     chan struct{}      // closed by Shutdown: serve loops stop reading new requests
+	drained      chan struct{}      // closed when every connection goroutine has returned
+	cancelProc   context.CancelFunc // cancels request processing when the grace period expires
+	shutdownOnce sync.Once
 }
 
 // NewServer returns a Server that will bind to addr. A non-positive gracePeriod
@@ -42,6 +47,8 @@ func NewServer(addr string, gracePeriod time.Duration) *Server {
 		addr:        addr,
 		gracePeriod: gracePeriod,
 		acceptDone:  make(chan struct{}),
+		shutdown:    make(chan struct{}),
+		drained:     make(chan struct{}),
 	}
 }
 
@@ -56,7 +63,10 @@ func (s *Server) Start() error {
 	s.listener = ln
 	s.boundAddr = ln.Addr().String()
 
-	go s.acceptLoop()
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancelProc = cancel
+
+	go s.acceptLoop(ctx)
 	return nil
 }
 
@@ -65,7 +75,7 @@ func (s *Server) Addr() string {
 	return s.boundAddr
 }
 
-func (s *Server) acceptLoop() {
+func (s *Server) acceptLoop(ctx context.Context) {
 	defer close(s.acceptDone)
 	for {
 		conn, err := s.listener.Accept()
@@ -77,16 +87,30 @@ func (s *Server) acceptLoop() {
 			}
 			return
 		}
-		s.conns.Go(func() { s.serve(conn) })
+		s.conns.Go(func() { s.serve(ctx, conn) })
 	}
 }
 
 // serve reads newline-terminated requests from one connection and writes one
 // response per request, strictly in order. It returns when the client closes
-// the connection or a read/write fails. An incomplete final line (no newline)
-// is discarded without a response.
-func (s *Server) serve(conn net.Conn) {
+// the connection, a read/write fails, or shutdown wakes a blocked read. An
+// incomplete final line (no newline) is discarded without a response.
+func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
+
+	// Bridge shutdown to this connection: once Shutdown closes s.shutdown, a
+	// past read deadline unblocks any in-progress read so an idle connection
+	// exits immediately instead of waiting out the grace period. A connection
+	// mid-request is unaffected — it is not reading — and finishes under ctx.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-s.shutdown:
+			_ = conn.SetReadDeadline(time.Now())
+		case <-stop:
+		}
+	}()
 
 	r := bufio.NewReader(conn)
 	for {
@@ -94,27 +118,42 @@ func (s *Server) serve(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		resp := handleRequest(context.Background(), strings.TrimRight(line, "\r\n"))
+		resp := handleRequest(ctx, strings.TrimRight(line, "\r\n"))
 		if _, err := io.WriteString(conn, resp+"\n"); err != nil {
 			return
 		}
 	}
 }
 
-// Shutdown stops the listener and waits for in-flight connections to finish or
-// for ctx to be cancelled. Call once, after a successful Start.
+// Shutdown stops accepting connections, then drains in-flight requests: they get
+// the grace period to finish normally, after which any still running are
+// cancelled (yielding RESPONSE|REJECTED|Cancelled) and their connections closed.
+// Connections idle between requests are dropped at once, without a response.
+// Shutdown blocks until every connection has ended or ctx is cancelled; it is
+// idempotent. Call after a successful Start.
 func (s *Server) Shutdown(ctx context.Context) error {
-	_ = s.listener.Close()
-	<-s.acceptDone
+	s.shutdownOnce.Do(func() {
+		_ = s.listener.Close()
+		<-s.acceptDone    // no new connection goroutines after this
+		close(s.shutdown) // phase 1: wake idle reads — they exit now, not after grace
 
-	done := make(chan struct{})
-	go func() {
-		s.conns.Wait()
-		close(done)
-	}()
+		go func() {
+			s.conns.Wait()
+			close(s.drained)
+		}()
+		go func() {
+			timer := time.NewTimer(s.gracePeriod)
+			defer timer.Stop()
+			select {
+			case <-timer.C: // phase 2: grace expired, cancel whatever is still running
+			case <-s.drained: // everything finished in time
+			}
+			s.cancelProc()
+		}()
+	})
 
 	select {
-	case <-done:
+	case <-s.drained:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -207,8 +246,12 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	log.Println("shutdown: draining connections")
-	ctx, cancel := context.WithTimeout(context.Background(), defaultGracePeriod)
+	log.Printf("shutdown: draining connections (%s grace)", defaultGracePeriod)
+
+	// Shutdown owns the grace-period timing; this context is only a backstop so a
+	// wedged connection (e.g. a peer that never reads its response) can't hold
+	// the process open past a bounded margin.
+	ctx, cancel := context.WithTimeout(context.Background(), defaultGracePeriod+2*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("shutdown: %v", err)

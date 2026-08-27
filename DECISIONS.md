@@ -136,3 +136,45 @@
   (`TestHandleRequestCancelled`). The alternative, `_ = processingDelay(...)`,
   would silently drop cancellation and leave nothing to wire in Step 5. This
   also deletes the prototype's duplicate inline `time.Sleep` + cap.
+
+## Step 5 — Graceful shutdown
+
+- **Two phases, one ordering.** `Shutdown` does: close the listener → wait for
+  `acceptDone` → `close(s.shutdown)` → start the grace timer → wait for `drained`
+  or the caller's `ctx`. `close(s.shutdown)` *before* the timer is what lets idle
+  connections leave in phase 1 instead of sitting through the grace period.
+
+- **Idle vs in-flight is positional, enforced by two mechanisms.**
+  `close(s.shutdown)` triggers a per-connection bridge goroutine that sets a past
+  read deadline — waking anything blocked in `ReadString` (idle, "not accepted":
+  it exits with no response). A connection between a completed read and its write
+  is not reading, so the deadline is inert; it runs under the processing context
+  until either it finishes or the grace timer fires `s.cancelProc()`, turning
+  `processingDelay` into `RESPONSE|REJECTED|Cancelled`.
+
+- **One bridge goroutine per connection.** It only translates a channel close
+  into a `SetReadDeadline` call, then exits via `defer close(stop)` on every
+  `serve` return path. A goroutine purely to bridge a signal to a deadline is a
+  deliberate trade — the alternative, an `http.Server`-style mutex-guarded
+  connection map, is more shared state than this earns. `TestShutdownNoGoroutineLeak`
+  guards against the bridge outliving its connection.
+
+- **The processing context is a parameter, never a struct field.** `Start`
+  creates it and threads it `acceptLoop(ctx)` → `serve(ctx, conn)`; only the
+  `CancelFunc` is stored. Avoids holding a `context.Context` in a struct.
+
+- **No write deadline.** A peer that never reads its response would hold one
+  `serve` goroutine and delay `conns.Wait()` past the grace period. The brief
+  excludes slow/stuck clients, so this is unhandled by design. `main` passes a
+  `gracePeriod + 2s` backstop context to `Shutdown` so the *process* still exits
+  in bounded time even then; `Shutdown` itself owns the grace timing via
+  `s.gracePeriod`, and its `ctx` argument is only that backstop.
+
+- **`Shutdown` is idempotent** (`sync.Once`): tests call it both explicitly and
+  via `t.Cleanup`, and a shutdown method that is safe to call twice is good
+  hygiene regardless. Second and later calls just wait on `drained`.
+
+- **Drained-before-grace is fine.** If everything finishes quickly, `drained`
+  closes, the timer goroutine's `select` takes that branch and calls
+  `s.cancelProc()` on a context nobody is using — harmless — and `Shutdown`
+  returns `nil` from its own `select` independently.
