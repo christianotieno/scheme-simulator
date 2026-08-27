@@ -89,9 +89,9 @@
 
 - **`Shutdown(ctx context.Context) error` is built incrementally.** Step 3: close
   the listener, wait for `acceptDone`, then wait for `conns` or `ctx`. Step 5
-  adds the grace period → `RESPONSE|REJECTED|Cancelled` → close behaviour.
-  `Shutdown` is called once, by `main`, after a successful `Start` — no
-  `sync.Once` guard for a caller that doesn't exist.
+  adds the grace period → `RESPONSE|REJECTED|Cancelled` → close behaviour and
+  makes it idempotent (see the Step 5 section). It is called after a successful
+  `Start`.
 
 - **Config is two constructor args, not a `Config` struct.** `addr` and
   `gracePeriod` don't warrant a struct yet; `NewServer` clamps a non-positive
