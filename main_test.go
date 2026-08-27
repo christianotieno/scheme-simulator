@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"strconv"
 	"testing"
 	"time"
@@ -173,5 +174,76 @@ func TestProcessingDelayContextAlreadyCancelled(t *testing.T) {
 		if elapsed > delayTolerance {
 			t.Errorf("processingDelay(cancelled ctx, %d) took %v; want immediate return", amount, elapsed)
 		}
+	}
+}
+
+func TestNewServerDefaultGracePeriod(t *testing.T) {
+	if got := NewServer("127.0.0.1:0", 0).gracePeriod; got != defaultGracePeriod {
+		t.Errorf("gracePeriod = %v; want default %v", got, defaultGracePeriod)
+	}
+	if got := NewServer("127.0.0.1:0", 5*time.Second).gracePeriod; got != 5*time.Second {
+		t.Errorf("gracePeriod = %v; want 5s", got)
+	}
+}
+
+func TestServerAddrEmptyBeforeStart(t *testing.T) {
+	if got := NewServer("127.0.0.1:0", time.Second).Addr(); got != "" {
+		t.Errorf("Addr() before Start = %q; want empty", got)
+	}
+}
+
+func TestServerStartBindsAndAccepts(t *testing.T) {
+	s := NewServer("127.0.0.1:0", time.Second)
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start() = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	host, port, err := net.SplitHostPort(s.Addr())
+	if err != nil {
+		t.Fatalf("Addr() = %q: %v", s.Addr(), err)
+	}
+	if host != "127.0.0.1" {
+		t.Errorf("Addr() host = %q; want 127.0.0.1", host)
+	}
+	if port == "" || port == "0" {
+		t.Errorf("Addr() port = %q; want the OS-assigned port", port)
+	}
+
+	conn, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatalf("Dial(%q) = %v; want a listening server", s.Addr(), err)
+	}
+	_ = conn.Close()
+}
+
+func TestServerStartRejectsBusyAddr(t *testing.T) {
+	s1 := NewServer("127.0.0.1:0", time.Second)
+	if err := s1.Start(); err != nil {
+		t.Fatalf("s1.Start() = %v", err)
+	}
+	t.Cleanup(func() { _ = s1.Shutdown(context.Background()) })
+
+	s2 := NewServer(s1.Addr(), time.Second)
+	if err := s2.Start(); err == nil {
+		_ = s2.Shutdown(context.Background())
+		t.Fatalf("s2.Start() on in-use %s = nil; want a bind error", s1.Addr())
+	}
+}
+
+func TestServerShutdownStopsListener(t *testing.T) {
+	s := NewServer("127.0.0.1:0", time.Second)
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start() = %v", err)
+	}
+	addr := s.Addr()
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() = %v", err)
+	}
+
+	if conn, err := net.Dial("tcp", addr); err == nil {
+		_ = conn.Close()
+		t.Fatal("Dial succeeded after Shutdown; want connection refused")
 	}
 }
