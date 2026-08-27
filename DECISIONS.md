@@ -29,6 +29,12 @@ Where the brief left room for interpretation, these are the choices made and why
 - **The delay cap is `min(amount ms, 10s)`.** `amount == 10000` is already
   exactly 10s, so "10s max for amounts over 10 000" needs no special case.
 
+- **On shutdown, connections idle between requests are closed at once; only
+  connections with a request already read are drained.** A connection with no
+  request in flight when shutdown begins gets no response, even if the client
+  sends one during the grace period.
+  `TestShutdownIdleConnectionRequestMidGraceGetsNoResponse` pins this.
+
 - **Shutdown rejects every new request once the grace period expires**,
   including amounts ≤ 100 that have no delay. The client should not have to know
   which amounts are cancellable.

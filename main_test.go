@@ -499,6 +499,39 @@ func TestShutdownDropsIdleConnectionPromptly(t *testing.T) {
 	}
 }
 
+// A request sent on a connection that was idle when shutdown began gets no
+// response, even while the server is still draining another connection: only a
+// request already read off the socket is drained.
+func TestShutdownIdleConnectionRequestMidGraceGetsNoResponse(t *testing.T) {
+	s := startTestServer(t, 2*time.Second)
+
+	busy := dial(t, s)
+	if _, err := io.WriteString(busy, "PAYMENT|400\n"); err != nil {
+		t.Fatalf("write busy: %v", err)
+	}
+
+	idle := dial(t, s)
+	time.Sleep(50 * time.Millisecond) // idle's serve goroutine is blocked in ReadString
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		_ = s.Shutdown(context.Background())
+		close(shutdownDone)
+	}()
+	time.Sleep(50 * time.Millisecond) // shutdown has closed the idle connection
+
+	// Write may fail (connection already closed); either way no response comes back.
+	_, _ = io.WriteString(idle, "PAYMENT|10\n")
+	if resp, err := bufio.NewReader(idle).ReadString('\n'); err == nil {
+		t.Errorf("idle connection got %q; want no response after shutdown began", strings.TrimRight(resp, "\r\n"))
+	}
+
+	if got := readResponse(t, bufio.NewReader(busy)); got != acceptedResponse {
+		t.Errorf("busy connection response = %q; want %q (still completes within grace)", got, acceptedResponse)
+	}
+	<-shutdownDone
+}
+
 // New connections are refused once Shutdown has closed the listener.
 func TestShutdownRefusesNewConnections(t *testing.T) {
 	s := startTestServer(t, time.Second)

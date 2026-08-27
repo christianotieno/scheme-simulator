@@ -27,6 +27,9 @@ Response  RESPONSE|ACCEPTED|Transaction processed
 
 ## Build, run, test
 
+Requires Go 1.26.4 or newer (the version declared in `go.mod`; `sync.WaitGroup.Go`
+needs at least Go 1.25).
+
 ```sh
 make build   # -> build/scheme-simulator
 make run     # listens on 127.0.0.1:8080
