@@ -37,3 +37,25 @@
 
 - **Standard library only.** Dropped the `testify` dependency the prototype used;
   tests use `testing` alone.
+
+## Step 2 — Context-aware processing delay
+
+- **`processingDelay(ctx context.Context, amount int) error`**, a free function.
+  Returns `nil` once the delay elapses, `ctx.Err()` if the context is cancelled
+  first. No server state involved, so it stays a plain testable function.
+
+- **A cancelled context wins even for sub-threshold amounts.** `amount <= 100`
+  has no delay, but `processingDelay` still checks `ctx.Err()` first and returns
+  it. During shutdown a draining server should reject *every* new request once
+  the grace period is up, not just the slow ones — and the caller shouldn't have
+  to know which amounts are cancellable.
+
+- **Cap: `min(amount ms, 10s)`.** `amount == 10000` is already exactly 10s, so a
+  single `min` expresses "10s max for amounts over 10 000".
+
+- **`time.NewTimer` + `select`, timer stopped on return.** No goroutine, no leak.
+
+- **10s cap test runs in real time, skipped under `-short`.** Injecting a clock
+  to make it fast would add an abstraction the rest of the code doesn't need.
+  `make test` runs the full suite; `go test -short` is the fast inner loop.
+  Time assertions use a 50ms tolerance, as the brief allows.

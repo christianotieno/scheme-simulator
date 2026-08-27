@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -78,6 +79,30 @@ func rejectReason(err error) string {
 		return reasonInvalidAmount
 	}
 	return reasonInvalidRequest
+}
+
+const maxProcessingDelay = 10 * time.Second
+
+// processingDelay blocks for the simulated counterparty processing delay: amount
+// milliseconds for amounts over 100, capped at maxProcessingDelay, nothing at or
+// below 100. It returns ctx.Err() if ctx is cancelled before the delay elapses.
+func processingDelay(ctx context.Context, amount int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if amount <= 100 {
+		return nil
+	}
+
+	timer := time.NewTimer(min(time.Duration(amount)*time.Millisecond, maxProcessingDelay))
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func handleRequest(request string) string {
