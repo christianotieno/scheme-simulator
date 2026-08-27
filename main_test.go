@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,9 +18,9 @@ import (
 const acceptedResponse = "RESPONSE|ACCEPTED|Transaction processed"
 
 // startTestServer starts a Server on an ephemeral port and registers cleanup.
-func startTestServer(t *testing.T) *Server {
+func startTestServer(t *testing.T, grace time.Duration) *Server {
 	t.Helper()
-	s := NewServer("127.0.0.1:0", time.Second)
+	s := NewServer("127.0.0.1:0", grace)
 	if err := s.Start(); err != nil {
 		t.Fatalf("Start() = %v", err)
 	}
@@ -317,7 +318,7 @@ func TestHandleRequestCancelled(t *testing.T) {
 }
 
 func TestServeSequentialRequestsOnOneConnection(t *testing.T) {
-	s := startTestServer(t)
+	s := startTestServer(t, time.Second)
 	conn := dial(t, s)
 	r := bufio.NewReader(conn)
 
@@ -339,7 +340,7 @@ func TestServeSequentialRequestsOnOneConnection(t *testing.T) {
 // must answer the slow one first and only then process the fast one — one
 // request at a time, responses in order.
 func TestServeOneRequestAtATime(t *testing.T) {
-	s := startTestServer(t)
+	s := startTestServer(t, time.Second)
 	conn := dial(t, s)
 
 	if _, err := io.WriteString(conn, "PAYMENT|250\nPAYMENT|10\n"); err != nil {
@@ -372,7 +373,7 @@ func TestServeOneRequestAtATime(t *testing.T) {
 }
 
 func TestServeConcurrentConnections(t *testing.T) {
-	s := startTestServer(t)
+	s := startTestServer(t, time.Second)
 
 	const n = 20
 	var wg sync.WaitGroup
@@ -417,7 +418,7 @@ func TestServeConcurrentConnections(t *testing.T) {
 }
 
 func TestServeCRLFFraming(t *testing.T) {
-	s := startTestServer(t)
+	s := startTestServer(t, time.Second)
 	conn := dial(t, s)
 
 	if _, err := io.WriteString(conn, "PAYMENT|10\r\n"); err != nil {
@@ -435,7 +436,7 @@ func TestServeCRLFFraming(t *testing.T) {
 // A request with no terminating newline is not a complete frame: when the client
 // half-closes, the server discards it without responding.
 func TestServeUnterminatedRequestGetsNoResponse(t *testing.T) {
-	s := startTestServer(t)
+	s := startTestServer(t, time.Second)
 	conn := dial(t, s)
 
 	if _, err := io.WriteString(conn, "PAYMENT|10"); err != nil {
@@ -451,5 +452,139 @@ func TestServeUnterminatedRequestGetsNoResponse(t *testing.T) {
 
 	if resp, err := bufio.NewReader(conn).ReadString('\n'); err == nil {
 		t.Errorf("got response %q; want none for an unterminated request", strings.TrimRight(resp, "\r\n"))
+	}
+}
+
+// --- Step 5: graceful shutdown ---
+
+// A request read off the socket just before shutdown completes normally as long
+// as it finishes inside the grace period.
+func TestShutdownServesInflightWithinGrace(t *testing.T) {
+	s := startTestServer(t, 2*time.Second)
+	conn := dial(t, s)
+
+	if _, err := io.WriteString(conn, "PAYMENT|400\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond) // let the server read it and start processing
+
+	start := time.Now()
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() = %v", err)
+	}
+	elapsed := time.Since(start)
+
+	resp, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if got := strings.TrimRight(resp, "\r\n"); got != acceptedResponse {
+		t.Errorf("response = %q; want %q (finished within grace)", got, acceptedResponse)
+	}
+	if elapsed > time.Second {
+		t.Errorf("Shutdown took %v; want ~350ms (drained well before the 2s grace)", elapsed)
+	}
+}
+
+// A request still processing when the grace period expires is rejected with
+// Cancelled — and that response is delivered, not just the socket closed.
+func TestShutdownCancelsInflightExceedingGrace(t *testing.T) {
+	s := startTestServer(t, 200*time.Millisecond)
+	conn := dial(t, s)
+
+	if _, err := io.WriteString(conn, "PAYMENT|5000\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() = %v", err)
+	}
+	elapsed := time.Since(start)
+
+	resp, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if got := strings.TrimRight(resp, "\r\n"); got != "RESPONSE|REJECTED|Cancelled" {
+		t.Errorf("response = %q; want RESPONSE|REJECTED|Cancelled", got)
+	}
+	if elapsed > time.Second {
+		t.Errorf("Shutdown took %v; want ~200ms grace, not the full 5s delay", elapsed)
+	}
+}
+
+// An idle connection (blocked waiting for its next request) is not an in-flight
+// request: shutdown drops it immediately instead of waiting out the grace period.
+func TestShutdownDropsIdleConnectionPromptly(t *testing.T) {
+	s := startTestServer(t, 5*time.Second)
+	conn := dial(t, s)
+	time.Sleep(50 * time.Millisecond) // ensure the serve goroutine is blocked in ReadString
+
+	start := time.Now()
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Shutdown took %v with only an idle connection; want prompt", elapsed)
+	}
+
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err == nil {
+		t.Error("idle connection got a response; want none")
+	}
+}
+
+// New connections are refused once Shutdown has closed the listener.
+func TestShutdownRefusesNewConnections(t *testing.T) {
+	s := startTestServer(t, time.Second)
+	addr := s.Addr()
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() = %v", err)
+	}
+
+	if conn, err := net.Dial("tcp", addr); err == nil {
+		_ = conn.Close()
+		t.Fatal("Dial succeeded after Shutdown; want connection refused")
+	}
+}
+
+// After a full start / serve / shutdown cycle, no goroutines are left behind —
+// in particular the per-connection bridge goroutines.
+func TestShutdownNoGoroutineLeak(t *testing.T) {
+	base := runtime.NumGoroutine()
+
+	s := startTestServer(t, time.Second)
+
+	for i := range 5 {
+		conn, err := net.Dial("tcp", s.Addr())
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		if _, err := io.WriteString(conn, "PAYMENT|10\n"); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		_ = conn.Close()
+	}
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() = %v", err)
+	}
+
+	// Goroutines unwind asynchronously; poll back toward the baseline.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		n := runtime.NumGoroutine()
+		if n <= base {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutine leak: %d running, baseline %d", n, base)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
