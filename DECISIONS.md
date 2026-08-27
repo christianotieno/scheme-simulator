@@ -59,3 +59,44 @@
   to make it fast would add an abstraction the rest of the code doesn't need.
   `make test` runs the full suite; `go test -short` is the fast inner loop.
   Time assertions use a 50ms tolerance, as the brief allows.
+
+## Step 3 — Server type and lifecycle
+
+- **`Start()` binds synchronously, accepts asynchronously.** Unlike
+  `http.ListenAndServe`, `Start` returns as soon as the listener is bound, so
+  bind errors surface as a return value and tests read `Addr()` immediately with
+  no sleeping. The accept loop runs in its own goroutine.
+
+- **`Addr()` returns a string snapshotted during `Start`, not `listener.Addr()`.**
+  It is written once, before the accept goroutine exists, and every `Addr()` call
+  is ordered after `Start()` returns — so it needs no mutex and stays `-race`
+  clean. Contract: call `Start` (and check its error) before `Addr()`; calling
+  `Addr()` concurrently with an in-progress `Start` is misuse. Bonus: the
+  snapshot keeps working after `Shutdown` closes the listener.
+
+- **The accept loop is tracked by a channel (`acceptDone`), connections by a
+  `sync.WaitGroup` (`conns`).** A WaitGroup is a dynamic counter; "wait for this
+  one goroutine" is a channel. Keeping them separate means `conns.Wait()` in
+  `Shutdown` means exactly "every in-flight connection is done", and the Step 5
+  grace-period deadline never accidentally applies to the accept loop.
+  `acceptDone` is created in `NewServer` so a receive on it can never block
+  forever.
+
+- **Every `Accept` error is terminal.** The expected one at shutdown is
+  `net.ErrClosed` (silent); anything else is logged and also ends the loop. The
+  brief excludes advanced network conditions, so there is no retry/backoff on
+  transient accept errors.
+
+- **`Shutdown(ctx context.Context) error` is built incrementally.** Step 3: close
+  the listener, wait for `acceptDone`, then wait for `conns` or `ctx`. Step 5
+  adds the grace period → `RESPONSE|REJECTED|Cancelled` → close behaviour.
+  `Shutdown` is called once, by `main`, after a successful `Start` — no
+  `sync.Once` guard for a caller that doesn't exist.
+
+- **Config is two constructor args, not a `Config` struct.** `addr` and
+  `gracePeriod` don't warrant a struct yet; `NewServer` clamps a non-positive
+  grace period to `defaultGracePeriod` (3s). `main` owns signal handling and
+  drives `Shutdown` with a `defaultGracePeriod` timeout context.
+
+- **`conns.Go(func(){...})`** (Go 1.25) instead of manual `Add`/`Done` — same
+  semantics, less boilerplate.
