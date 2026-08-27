@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -45,15 +46,44 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-func handleRequest(request string) string {
-	parts := strings.Split(request, "|")
-	if len(parts) != 2 || parts[0] != "PAYMENT" {
-		return "RESPONSE|REJECTED|Invalid request"
+// Wire-format rejection reasons.
+const (
+	reasonInvalidRequest = "Invalid request"
+	reasonInvalidAmount  = "Invalid amount"
+)
+
+var (
+	errInvalidRequest = errors.New("invalid request")
+	errInvalidAmount  = errors.New("invalid amount")
+)
+
+// parseRequest parses a request line of the form "PAYMENT|<amount>" (framing
+// already stripped), returning the amount or errInvalidRequest / errInvalidAmount.
+func parseRequest(line string) (int, error) {
+	rest, ok := strings.CutPrefix(line, "PAYMENT|")
+	if !ok || strings.Contains(rest, "|") {
+		return 0, errInvalidRequest
 	}
 
-	amount, err := strconv.Atoi(parts[1])
+	amount, err := strconv.Atoi(rest)
+	if err != nil || amount <= 0 {
+		return 0, errInvalidAmount
+	}
+	return amount, nil
+}
+
+// rejectReason maps a parseRequest error to its wire-format reason.
+func rejectReason(err error) string {
+	if errors.Is(err, errInvalidAmount) {
+		return reasonInvalidAmount
+	}
+	return reasonInvalidRequest
+}
+
+func handleRequest(request string) string {
+	amount, err := parseRequest(request)
 	if err != nil {
-		return "RESPONSE|REJECTED|Invalid amount"
+		return "RESPONSE|REJECTED|" + rejectReason(err)
 	}
 
 	if amount > 100 {
