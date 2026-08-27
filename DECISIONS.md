@@ -99,4 +99,40 @@
   drives `Shutdown` with a `defaultGracePeriod` timeout context.
 
 - **`conns.Go(func(){...})`** (Go 1.25) instead of manual `Add`/`Done` — same
-  semantics, less boilerplate.
+  semantics, less boilerplate. Safe to rely on: the repo's own `go.mod` has
+  declared `go 1.26.4` since the initial commit, so the language floor is above
+  1.25.
+
+## Step 4 — Connection read loop
+
+- **`serve` uses `bufio.Reader.ReadString('\n')`, not `bufio.Scanner`.**
+  `ReadString` keeps the delimiter (so an unterminated final line is visibly
+  incomplete and we return an error), has no hidden token-size limit to trip
+  over, and pairs naturally with `io.WriteString(conn, resp+"\n")`.
+
+- **One goroutine per connection, one request at a time within it.** The loop
+  reads a full line, processes it to completion, writes the response, then reads
+  again — so responses are strictly ordered and a slow request blocks later ones
+  on the *same* connection (proven by `TestServeOneRequestAtATime`, which
+  pipelines a slow + fast pair). Different connections run concurrently.
+
+- **`strings.TrimRight(line, "\r\n")` strips framing before `parseRequest`.** A
+  payload never legitimately ends in `\r` or `\n`; this is why `parseRequest`
+  treats a trailing `\r` as invalid (Step 1) — by its contract, framing is
+  already gone.
+
+- **An unterminated request gets no response.** `ReadString` returns an error
+  (no delimiter) and `serve` returns, discarding the partial line. This is the
+  "requests not yet fully received may be dropped without a response" case.
+
+- **No line-length cap.** A client that streams bytes without a newline grows
+  the buffer unboundedly. The brief explicitly scopes out slow clients and
+  adversarial network conditions, so a cap would defend against a threat model
+  that isn't in play.
+
+- **`handleRequest(ctx, line)` and its `Cancelled` branch exist now, wired in
+  Step 5.** `serve` passes `context.Background()` this step, so the branch is
+  unreachable from the server — but it is unit-tested directly
+  (`TestHandleRequestCancelled`). The alternative, `_ = processingDelay(...)`,
+  would silently drop cancellation and leave nothing to wire in Step 5. This
+  also deletes the prototype's duplicate inline `time.Sleep` + cap.

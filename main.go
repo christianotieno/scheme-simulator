@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -81,18 +81,23 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-// serve handles requests on one connection until the client disconnects.
+// serve reads newline-terminated requests from one connection and writes one
+// response per request, strictly in order. It returns when the client closes
+// the connection or a read/write fails. An incomplete final line (no newline)
+// is discarded without a response.
 func (s *Server) serve(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
-	scanner := bufio.NewScanner(conn)
-	for scanner.Scan() {
-		if _, err := fmt.Fprintf(conn, "%s\n", handleRequest(scanner.Text())); err != nil {
+	r := bufio.NewReader(conn)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
 			return
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("connection read: %v", err)
+		resp := handleRequest(context.Background(), strings.TrimRight(line, "\r\n"))
+		if _, err := io.WriteString(conn, resp+"\n"); err != nil {
+			return
+		}
 	}
 }
 
@@ -120,6 +125,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 const (
 	reasonInvalidRequest = "Invalid request"
 	reasonInvalidAmount  = "Invalid amount"
+	reasonCancelled      = "Cancelled"
 )
 
 var (
@@ -174,20 +180,17 @@ func processingDelay(ctx context.Context, amount int) error {
 	}
 }
 
-func handleRequest(request string) string {
-	amount, err := parseRequest(request)
+// handleRequest validates one request line, applies the processing delay, and
+// returns the wire response. A ctx cancelled before the delay elapses yields
+// RESPONSE|REJECTED|Cancelled.
+func handleRequest(ctx context.Context, line string) string {
+	amount, err := parseRequest(line)
 	if err != nil {
 		return "RESPONSE|REJECTED|" + rejectReason(err)
 	}
-
-	if amount > 100 {
-		processingTime := amount
-		if amount > 10000 {
-			processingTime = 10000
-		}
-		time.Sleep(time.Duration(processingTime) * time.Millisecond)
+	if err := processingDelay(ctx, amount); err != nil {
+		return "RESPONSE|REJECTED|" + reasonCancelled
 	}
-
 	return "RESPONSE|ACCEPTED|Transaction processed"
 }
 

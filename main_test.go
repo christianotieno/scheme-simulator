@@ -380,9 +380,7 @@ func TestServeConcurrentConnections(t *testing.T) {
 
 	start := time.Now()
 	for i := range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			conn, err := net.Dial("tcp", s.Addr())
 			if err != nil {
 				errs <- err
@@ -402,7 +400,7 @@ func TestServeConcurrentConnections(t *testing.T) {
 			if got := strings.TrimRight(resp, "\r\n"); got != acceptedResponse {
 				errs <- fmt.Errorf("conn %d: got %q, want %q", i, got, acceptedResponse)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
