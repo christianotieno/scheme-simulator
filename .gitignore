@@ -1,4 +1,6 @@
 build/
+# bare `go build .` output (module name); `make build` uses build/ instead
+/interview-simulator
 
 # Compiled binaries
 *.exe
