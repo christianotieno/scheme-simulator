@@ -1,13 +1,55 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+const acceptedResponse = "RESPONSE|ACCEPTED|Transaction processed"
+
+// startTestServer starts a Server on an ephemeral port and registers cleanup.
+func startTestServer(t *testing.T) *Server {
+	t.Helper()
+	s := NewServer("127.0.0.1:0", time.Second)
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start() = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	return s
+}
+
+// dial opens a connection to the server and registers cleanup.
+func dial(t *testing.T, s *Server) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatalf("Dial(%q) = %v", s.Addr(), err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// request writes one framed request and reads one framed response.
+func request(t *testing.T, conn net.Conn, r *bufio.Reader, req string) string {
+	t.Helper()
+	if _, err := io.WriteString(conn, req+"\n"); err != nil {
+		t.Fatalf("write %q: %v", req, err)
+	}
+	resp, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response to %q: %v", req, err)
+	}
+	return strings.TrimRight(resp, "\r\n")
+}
 
 func TestParseRequestValid(t *testing.T) {
 	for _, amount := range []int{1, 100, 101, 10000, 10001} {
@@ -245,5 +287,171 @@ func TestServerShutdownStopsListener(t *testing.T) {
 	if conn, err := net.Dial("tcp", addr); err == nil {
 		_ = conn.Close()
 		t.Fatal("Dial succeeded after Shutdown; want connection refused")
+	}
+}
+
+func TestHandleRequest(t *testing.T) {
+	cases := map[string]struct{ line, want string }{
+		"valid":           {"PAYMENT|10", acceptedResponse},
+		"valid at delay":  {"PAYMENT|101", acceptedResponse},
+		"invalid request": {"NOPE", "RESPONSE|REJECTED|Invalid request"},
+		"invalid amount":  {"PAYMENT|0", "RESPONSE|REJECTED|Invalid amount"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := handleRequest(context.Background(), tc.line); got != tc.want {
+				t.Errorf("handleRequest(%q) = %q; want %q", tc.line, got, tc.want)
+			}
+		})
+	}
+}
+
+// A context cancelled before the delay elapses turns an otherwise-valid request
+// into RESPONSE|REJECTED|Cancelled. Step 5 wires the server side that triggers it.
+func TestHandleRequestCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := handleRequest(ctx, "PAYMENT|5000"); got != "RESPONSE|REJECTED|Cancelled" {
+		t.Errorf("handleRequest(cancelled ctx, PAYMENT|5000) = %q; want RESPONSE|REJECTED|Cancelled", got)
+	}
+}
+
+func TestServeSequentialRequestsOnOneConnection(t *testing.T) {
+	s := startTestServer(t)
+	conn := dial(t, s)
+	r := bufio.NewReader(conn)
+
+	steps := []struct{ req, want string }{
+		{"PAYMENT|10", acceptedResponse},
+		{"PAYMENT|-1", "RESPONSE|REJECTED|Invalid amount"},
+		{"GARBAGE", "RESPONSE|REJECTED|Invalid request"},
+		{"PAYMENT|50", acceptedResponse},
+		{"PAYMENT|101", acceptedResponse},
+	}
+	for _, step := range steps {
+		if got := request(t, conn, r, step.req); got != step.want {
+			t.Errorf("%q -> %q; want %q", step.req, got, step.want)
+		}
+	}
+}
+
+// Two requests are written back-to-back without reading in between. The server
+// must answer the slow one first and only then process the fast one — one
+// request at a time, responses in order.
+func TestServeOneRequestAtATime(t *testing.T) {
+	s := startTestServer(t)
+	conn := dial(t, s)
+
+	if _, err := io.WriteString(conn, "PAYMENT|250\nPAYMENT|10\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	r := bufio.NewReader(conn)
+	start := time.Now()
+
+	first, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read first: %v", err)
+	}
+	firstAt := time.Since(start)
+
+	second, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read second: %v", err)
+	}
+
+	if firstAt < 250*time.Millisecond {
+		t.Errorf("first response at %v; want >= 250ms (slow request processed before the fast one)", firstAt)
+	}
+	if got := strings.TrimRight(first, "\r\n"); got != acceptedResponse {
+		t.Errorf("first response = %q; want %q", got, acceptedResponse)
+	}
+	if got := strings.TrimRight(second, "\r\n"); got != acceptedResponse {
+		t.Errorf("second response = %q; want %q", got, acceptedResponse)
+	}
+}
+
+func TestServeConcurrentConnections(t *testing.T) {
+	s := startTestServer(t)
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+
+	start := time.Now()
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := net.Dial("tcp", s.Addr())
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer func() { _ = conn.Close() }()
+
+			if _, err := io.WriteString(conn, "PAYMENT|150\n"); err != nil {
+				errs <- fmt.Errorf("conn %d write: %w", i, err)
+				return
+			}
+			resp, err := bufio.NewReader(conn).ReadString('\n')
+			if err != nil {
+				errs <- fmt.Errorf("conn %d read: %w", i, err)
+				return
+			}
+			if got := strings.TrimRight(resp, "\r\n"); got != acceptedResponse {
+				errs <- fmt.Errorf("conn %d: got %q, want %q", i, got, acceptedResponse)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	// 20 connections each delaying 150ms: concurrent handling finishes well
+	// under the ~3s a serial server would take. Budget is loose to tolerate
+	// scheduling jitter under -race on a loaded machine.
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("20 concurrent connections took %v; want concurrent handling", elapsed)
+	}
+}
+
+func TestServeCRLFFraming(t *testing.T) {
+	s := startTestServer(t)
+	conn := dial(t, s)
+
+	if _, err := io.WriteString(conn, "PAYMENT|10\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	resp, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := strings.TrimRight(resp, "\r\n"); got != acceptedResponse {
+		t.Errorf("CRLF-terminated request -> %q; want %q", got, acceptedResponse)
+	}
+}
+
+// A request with no terminating newline is not a complete frame: when the client
+// half-closes, the server discards it without responding.
+func TestServeUnterminatedRequestGetsNoResponse(t *testing.T) {
+	s := startTestServer(t)
+	conn := dial(t, s)
+
+	if _, err := io.WriteString(conn, "PAYMENT|10"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("conn is %T, want *net.TCPConn", conn)
+	}
+	if err := tcp.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+
+	if resp, err := bufio.NewReader(conn).ReadString('\n'); err == nil {
+		t.Errorf("got response %q; want none for an unterminated request", strings.TrimRight(resp, "\r\n"))
 	}
 }
