@@ -14,6 +14,11 @@ Where the brief left room for interpretation, these are the choices made and why
 - **Structure is validated before the amount.** `INVALID|abc` is `Invalid
   request`, not `Invalid amount`.
 
+- **The accepted response keeps the prototype's reason string,
+  `Transaction processed`.** The spec only says the reason is "additional
+  details if accepted", so rather than invent wording this preserves the
+  existing wire contract.
+
 - **Both `\n` and `\r\n` terminate a message.** The read loop strips a trailing
   `\r`/`\n`; a payload never legitimately ends that way.
 
