@@ -160,8 +160,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-// Wire-format rejection reasons.
+// Wire-format response strings.
 const (
+	acceptedResponse = "RESPONSE|ACCEPTED|Transaction processed"
+	rejectedPrefix   = "RESPONSE|REJECTED|" // followed by one of the reasons below
+
 	reasonInvalidRequest = "Invalid request"
 	reasonInvalidAmount  = "Invalid amount"
 	reasonCancelled      = "Cancelled"
@@ -225,12 +228,12 @@ func processingDelay(ctx context.Context, amount int) error {
 func handleRequest(ctx context.Context, line string) string {
 	amount, err := parseRequest(line)
 	if err != nil {
-		return "RESPONSE|REJECTED|" + rejectReason(err)
+		return rejectedPrefix + rejectReason(err)
 	}
 	if err := processingDelay(ctx, amount); err != nil {
-		return "RESPONSE|REJECTED|" + reasonCancelled
+		return rejectedPrefix + reasonCancelled
 	}
-	return "RESPONSE|ACCEPTED|Transaction processed"
+	return acceptedResponse
 }
 
 const defaultAddr = "127.0.0.1:8080"

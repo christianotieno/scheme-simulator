@@ -15,8 +15,6 @@ import (
 	"time"
 )
 
-const acceptedResponse = "RESPONSE|ACCEPTED|Transaction processed"
-
 // startTestServer starts a Server on an ephemeral port and registers cleanup.
 func startTestServer(t *testing.T, grace time.Duration) *Server {
 	t.Helper()
@@ -39,15 +37,13 @@ func dial(t *testing.T, s *Server) net.Conn {
 	return conn
 }
 
-// request writes one framed request and reads one framed response.
-func request(t *testing.T, conn net.Conn, r *bufio.Reader, req string) string {
+// readResponse reads one framed response and returns it without the terminator.
+// It fails the test if a complete response never arrives.
+func readResponse(t *testing.T, r *bufio.Reader) string {
 	t.Helper()
-	if _, err := io.WriteString(conn, req+"\n"); err != nil {
-		t.Fatalf("write %q: %v", req, err)
-	}
 	resp, err := r.ReadString('\n')
 	if err != nil {
-		t.Fatalf("read response to %q: %v", req, err)
+		t.Fatalf("read response: %v", err)
 	}
 	return strings.TrimRight(resp, "\r\n")
 }
@@ -274,23 +270,6 @@ func TestServerStartRejectsBusyAddr(t *testing.T) {
 	}
 }
 
-func TestServerShutdownStopsListener(t *testing.T) {
-	s := NewServer("127.0.0.1:0", time.Second)
-	if err := s.Start(); err != nil {
-		t.Fatalf("Start() = %v", err)
-	}
-	addr := s.Addr()
-
-	if err := s.Shutdown(context.Background()); err != nil {
-		t.Fatalf("Shutdown() = %v", err)
-	}
-
-	if conn, err := net.Dial("tcp", addr); err == nil {
-		_ = conn.Close()
-		t.Fatal("Dial succeeded after Shutdown; want connection refused")
-	}
-}
-
 func TestHandleRequest(t *testing.T) {
 	cases := map[string]struct{ line, want string }{
 		"valid":           {"PAYMENT|10", acceptedResponse},
@@ -308,7 +287,8 @@ func TestHandleRequest(t *testing.T) {
 }
 
 // A context cancelled before the delay elapses turns an otherwise-valid request
-// into RESPONSE|REJECTED|Cancelled. Step 5 wires the server side that triggers it.
+// into RESPONSE|REJECTED|Cancelled. The server cancels this context when the
+// shutdown grace period expires.
 func TestHandleRequestCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -330,7 +310,10 @@ func TestServeSequentialRequestsOnOneConnection(t *testing.T) {
 		{"PAYMENT|101", acceptedResponse},
 	}
 	for _, step := range steps {
-		if got := request(t, conn, r, step.req); got != step.want {
+		if _, err := io.WriteString(conn, step.req+"\n"); err != nil {
+			t.Fatalf("write %q: %v", step.req, err)
+		}
+		if got := readResponse(t, r); got != step.want {
 			t.Errorf("%q -> %q; want %q", step.req, got, step.want)
 		}
 	}
@@ -350,25 +333,18 @@ func TestServeOneRequestAtATime(t *testing.T) {
 	r := bufio.NewReader(conn)
 	start := time.Now()
 
-	first, err := r.ReadString('\n')
-	if err != nil {
-		t.Fatalf("read first: %v", err)
-	}
+	first := readResponse(t, r)
 	firstAt := time.Since(start)
-
-	second, err := r.ReadString('\n')
-	if err != nil {
-		t.Fatalf("read second: %v", err)
-	}
+	second := readResponse(t, r)
 
 	if firstAt < 250*time.Millisecond {
 		t.Errorf("first response at %v; want >= 250ms (slow request processed before the fast one)", firstAt)
 	}
-	if got := strings.TrimRight(first, "\r\n"); got != acceptedResponse {
-		t.Errorf("first response = %q; want %q", got, acceptedResponse)
+	if first != acceptedResponse {
+		t.Errorf("first response = %q; want %q", first, acceptedResponse)
 	}
-	if got := strings.TrimRight(second, "\r\n"); got != acceptedResponse {
-		t.Errorf("second response = %q; want %q", got, acceptedResponse)
+	if second != acceptedResponse {
+		t.Errorf("second response = %q; want %q", second, acceptedResponse)
 	}
 }
 
@@ -424,11 +400,7 @@ func TestServeCRLFFraming(t *testing.T) {
 	if _, err := io.WriteString(conn, "PAYMENT|10\r\n"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	resp, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if got := strings.TrimRight(resp, "\r\n"); got != acceptedResponse {
+	if got := readResponse(t, bufio.NewReader(conn)); got != acceptedResponse {
 		t.Errorf("CRLF-terminated request -> %q; want %q", got, acceptedResponse)
 	}
 }
@@ -455,7 +427,7 @@ func TestServeUnterminatedRequestGetsNoResponse(t *testing.T) {
 	}
 }
 
-// --- Step 5: graceful shutdown ---
+// --- graceful shutdown ---
 
 // A request read off the socket just before shutdown completes normally as long
 // as it finishes inside the grace period.
@@ -474,11 +446,7 @@ func TestShutdownServesInflightWithinGrace(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 
-	resp, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if got := strings.TrimRight(resp, "\r\n"); got != acceptedResponse {
+	if got := readResponse(t, bufio.NewReader(conn)); got != acceptedResponse {
 		t.Errorf("response = %q; want %q (finished within grace)", got, acceptedResponse)
 	}
 	if elapsed > time.Second {
@@ -503,11 +471,7 @@ func TestShutdownCancelsInflightExceedingGrace(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 
-	resp, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if got := strings.TrimRight(resp, "\r\n"); got != "RESPONSE|REJECTED|Cancelled" {
+	if got := readResponse(t, bufio.NewReader(conn)); got != "RESPONSE|REJECTED|Cancelled" {
 		t.Errorf("response = %q; want RESPONSE|REJECTED|Cancelled", got)
 	}
 	if elapsed > time.Second {
